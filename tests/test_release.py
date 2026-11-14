@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 import xml.etree.ElementTree as ET
 
 from cryptography.hazmat.primitives import serialization
@@ -41,6 +41,7 @@ class ReleaseTests(unittest.TestCase):
             "SUFeedURL": release.feed_url("Beastry/example"),
         }
         self.output = self.directory / "appcast.xml"
+        self.draft = {"draft": True, "id": 42, "tag_name": "v1.2.3", "target_commitish": "a" * 40}
 
     def generate(self, hardware="", feed=None):
         release.write_appcast(self.archive, self.metadata, self.signature,
@@ -130,47 +131,219 @@ class ReleaseTests(unittest.TestCase):
             with self.subTest(release=published), self.assertRaisesRegex(ValueError, "published"):
                 release.require_draft(published)
 
-    def test_published_release_causes_no_mutation(self):
-        self.prepare_assets()
-        with patch.object(release, "published_feed", return_value=None), \
-             patch.object(release, "existing_release", return_value={"draft": False}), \
-             patch.object(release, "gh_api") as api, patch.object(release, "command") as command:
-            with self.assertRaisesRegex(ValueError, "published"):
-                release.draft_release("Beastry/example", "v1.2.3", "a" * 40, self.directory)
-            api.assert_not_called()
-            command.assert_not_called()
+    def draft_api(self, pages=None, created=None, checks=None, assets=None):
+        pages = pages if pages is not None else [[self.draft]]
+        checks = iter(checks) if checks is not None else None
+        assets = assets if assets is not None else [[]]
 
-    def test_create_only_draft_no_latest_and_three_assets(self):
-        self.prepare_assets()
-        draft = {"draft": True, "id": 42, "target_commitish": "a" * 40}
-        with patch.object(release, "published_feed", return_value=None), \
-             patch.object(release, "existing_release", side_effect=[None, draft, draft, draft]), \
-             patch.object(release, "gh_api", return_value=draft) as api, \
-             patch.object(release, "command") as command:
-            release.draft_release("Beastry/example", "v1.2.3", "a" * 40, self.directory)
-            payload = api.call_args.args[1]
-            self.assertIs(payload["draft"], True)
-            self.assertIs(payload["prerelease"], False)
-            self.assertEqual(payload["make_latest"], "false")
-            self.assertEqual(payload["target_commitish"], "a" * 40)
-            self.assertEqual(command.call_count, 3)
-            self.assertTrue(all(call.args[0][:3] == ["gh", "release", "upload"] for call in command.call_args_list))
+        def respond(endpoint, payload=None, missing_ok=False, method=None):
+            if endpoint == "repos/Beastry/example/releases" and payload is not None:
+                return created if created is not None else self.draft.copy()
+            if endpoint.startswith("repos/Beastry/example/releases?per_page=100&page="):
+                return pages[int(endpoint.rsplit("=", 1)[1]) - 1]
+            if endpoint == "repos/Beastry/example/releases/42":
+                self.assertTrue(missing_ok)
+                return next(checks) if checks is not None else self.draft.copy()
+            if endpoint.startswith("repos/Beastry/example/releases/42/assets?per_page=100&page="):
+                return assets[int(endpoint.rsplit("=", 1)[1]) - 1]
+            if endpoint.startswith("repos/Beastry/example/releases/assets/") and method == "DELETE":
+                return None
+            self.fail(f"Unexpected GitHub API call: {endpoint}")
 
-    def test_existing_draft_rerun_and_publish_race(self):
-        self.prepare_assets()
-        draft = {"draft": True, "id": 42, "target_commitish": "a" * 40}
+        return Mock(side_effect=respond)
+
+    def run_draft(self, api, upload=None):
         with patch.object(release, "published_feed", return_value=None), \
-             patch.object(release, "existing_release", return_value=draft), \
-             patch.object(release, "gh_api") as api, patch.object(release, "command") as command:
+             patch.object(release, "gh_api", api), patch.object(release, "command", upload or Mock()) as command:
             release.draft_release("Beastry/example", "v1.2.3", "a" * 40, self.directory)
-            api.assert_not_called()
-            self.assertEqual(command.call_count, 3)
+        return command
+
+    def test_create_untagged_draft_rereads_id_before_upload(self):
+        self.prepare_assets()
+        api = self.draft_api(pages=[[]])
+        events = Mock()
+        events.attach_mock(api, "api")
+        upload = Mock()
+        events.attach_mock(upload, "upload")
+        self.run_draft(api, upload)
+        creation = api.call_args_list[1]
+        payload = creation.args[1]
+        self.assertEqual(creation.args[0], "repos/Beastry/example/releases")
+        self.assertIs(payload["draft"], True)
+        self.assertIs(payload["prerelease"], False)
+        self.assertEqual(payload["make_latest"], "false")
+        self.assertEqual(payload["target_commitish"], "a" * 40)
+        first_upload = next(index for index, event in enumerate(events.mock_calls) if event[0] == "upload")
+        self.assertEqual(events.mock_calls[first_upload - 1],
+                         call.api("repos/Beastry/example/releases/42", missing_ok=True))
+        self.assertEqual(upload.call_count, 3)
+        for invocation, asset in zip(upload.call_args_list,
+                                    (self.archive, self.archive.with_suffix(".dmg.sha256"), self.output)):
+            self.assertEqual(invocation.args[0], ["gh", "api",
+                f"https://uploads.github.com/repos/Beastry/example/releases/42/assets?name={asset.name}",
+                "--method", "POST", "-H", "Content-Type: application/octet-stream", "--input", str(asset)])
+
+    def test_matching_existing_draft_resumes_with_uploads(self):
+        self.prepare_assets()
+        api = self.draft_api()
+        upload = self.run_draft(api)
+        self.assertEqual(upload.call_count, 3)
+        self.assertTrue(all(len(invocation.args) == 1 for invocation in api.call_args_list))
+        self.assertIn(call("repos/Beastry/example/releases?per_page=100&page=1"), api.call_args_list)
+        self.assertIn(call("repos/Beastry/example/releases/42", missing_ok=True), api.call_args_list)
+
+    def test_matching_draft_on_later_page(self):
+        self.prepare_assets()
+        api = self.draft_api(pages=[[{**self.draft, "tag_name": f"v0.{index}"} for index in range(100)],
+                                    [self.draft]])
+        upload = self.run_draft(api)
+        self.assertEqual(upload.call_count, 3)
+        self.assertIn(call("repos/Beastry/example/releases?per_page=100&page=2"), api.call_args_list)
+
+    def test_invalid_existing_draft_causes_no_mutation(self):
+        self.prepare_assets()
+        for changes, message in (({"draft": False}, "published"),
+                                 ({"target_commitish": "b" * 40}, "source commit"),
+                                 ({"target_commitish": "main"}, "source commit")):
+            with self.subTest(changes=changes):
+                api = self.draft_api(pages=[[{**self.draft, **changes}]])
+                upload = Mock()
+                with self.assertRaisesRegex(ValueError, message):
+                    self.run_draft(api, upload)
+                upload.assert_not_called()
+                self.assertEqual(api.call_count, 1)
+
+    def test_invalid_creation_or_id_read_causes_no_mutation(self):
+        self.prepare_assets()
+        for changes in ({"draft": False}, {"tag_name": "v9.9.9"},
+                        {"target_commitish": "b" * 40}, {"id": None}):
+            for stage in ("create", "read"):
+                with self.subTest(changes=changes, stage=stage):
+                    invalid = {**self.draft, **changes}
+                    api = self.draft_api(pages=[[]], created=invalid) if stage == "create" else \
+                        self.draft_api(checks=[invalid])
+                    upload = Mock()
+                    with self.assertRaises(ValueError):
+                        self.run_draft(api, upload)
+                    upload.assert_not_called()
+                    self.assertFalse(any(invocation.kwargs.get("method") == "DELETE"
+                                         for invocation in api.call_args_list))
+
+    def test_concurrent_change_aborts_further_uploads(self):
+        self.prepare_assets()
+        for changes in (None, {"id": 43}, {"draft": False}, {"tag_name": "v9.9.9"},
+                        {"target_commitish": "b" * 40}):
+            for completed in (0, 1, 2):
+                with self.subTest(changes=changes, completed=completed):
+                    changed = None if changes is None else {**self.draft, **changes}
+                    api = self.draft_api(checks=[self.draft] * (completed * 3) + [changed])
+                    upload = Mock()
+                    with self.assertRaises(ValueError):
+                        self.run_draft(api, upload)
+                    self.assertEqual(upload.call_count, completed)
+
+    def test_final_upload_is_checked_for_concurrent_publish(self):
+        self.prepare_assets()
+        api = self.draft_api(checks=[self.draft] * 8 + [{**self.draft, "draft": False}])
+        upload = Mock()
+        with self.assertRaisesRegex(ValueError, "published"):
+            self.run_draft(api, upload)
+        self.assertEqual(upload.call_count, 3)
+
+    def test_clobber_deletes_only_matching_assets_including_later_page(self):
+        self.prepare_assets()
+        api = self.draft_api(assets=[[{"id": index, "name": f"keep-{index}"} for index in range(100)],
+                                    [{"id": 101, "name": self.archive.name}]])
+        events = Mock()
+        events.attach_mock(api, "api")
+        upload = Mock()
+        events.attach_mock(upload, "upload")
+        self.run_draft(api, upload)
+        deletions = [invocation for invocation in api.call_args_list if invocation.kwargs.get("method") == "DELETE"]
+        self.assertEqual(deletions, [call("repos/Beastry/example/releases/assets/101", method="DELETE")])
+        deletion_index = events.mock_calls.index(call.api("repos/Beastry/example/releases/assets/101", method="DELETE"))
+        self.assertEqual(events.mock_calls[deletion_index - 1],
+                         call.api("repos/Beastry/example/releases/42", missing_ok=True))
+        self.assertEqual(events.mock_calls[deletion_index + 1],
+                         call.api("repos/Beastry/example/releases/42", missing_ok=True))
+        self.assertEqual(events.mock_calls[deletion_index + 2][0], "upload")
+        self.assertEqual(upload.call_count, 3)
+
+    def test_clobber_rechecks_before_delete_and_replacement(self):
+        self.prepare_assets()
+        for successful_checks in (1, 2):
+            with self.subTest(successful_checks=successful_checks):
+                api = self.draft_api(checks=[self.draft] * successful_checks + [{**self.draft, "draft": False}],
+                                     assets=[[{"id": 101, "name": self.archive.name}]])
+                upload = Mock()
+                with self.assertRaisesRegex(ValueError, "published"):
+                    self.run_draft(api, upload)
+                upload.assert_not_called()
+                deletions = [invocation for invocation in api.call_args_list if invocation.kwargs.get("method") == "DELETE"]
+                self.assertEqual(len(deletions), successful_checks - 1)
+
+    def test_ambiguous_release_tag_refused(self):
+        self.prepare_assets()
+        api = self.draft_api(pages=[[self.draft] * 100, [{**self.draft, "id": 43}]])
+        upload = Mock()
+        with self.assertRaisesRegex(ValueError, "Multiple releases"):
+            self.run_draft(api, upload)
+        upload.assert_not_called()
+
+    def test_untagged_draft_through_gh_transport(self):
+        self.prepare_assets()
+        responses = [[], self.draft, self.draft, [], self.draft, {"id": 101}, self.draft,
+                     self.draft, [], self.draft, {"id": 102}, self.draft,
+                     self.draft, [], self.draft, {"id": 103}, self.draft]
         with patch.object(release, "published_feed", return_value=None), \
-             patch.object(release, "existing_release", side_effect=[draft, {**draft, "draft": False}]), \
-             patch.object(release, "command") as command:
-            with self.assertRaisesRegex(ValueError, "published"):
-                release.draft_release("Beastry/example", "v1.2.3", "a" * 40, self.directory)
-            command.assert_not_called()
+             patch.object(release.subprocess, "run", side_effect=[
+                 subprocess.CompletedProcess([], 0, json.dumps(response), "") for response in responses]) as run:
+            release.draft_release("Beastry/example", "v1.2.3", "a" * 40, self.directory)
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ["gh", "api", "repos/Beastry/example/releases?per_page=100&page=1"])
+        self.assertEqual(run.call_args_list[1].args[0],
+                         ["gh", "api", "repos/Beastry/example/releases", "--method", "POST", "--input", "-"])
+        self.assertEqual(run.call_args_list[2].args[0],
+                         ["gh", "api", "repos/Beastry/example/releases/42"])
+        self.assertEqual(run.call_count, len(responses))
+        uploads = [invocation for invocation in run.call_args_list
+                   if invocation.args[0][2].startswith("https://uploads.github.com/")]
+        self.assertEqual(len(uploads), 3)
+        for invocation in uploads:
+            self.assertEqual(invocation.args[0][-2], "--input")
+            self.assertTrue(Path(invocation.args[0][-1]).is_file())
+
+    def test_asset_failures_abort_without_further_uploads(self):
+        self.prepare_assets()
+        for operation in ("delete", "upload"):
+            with self.subTest(operation=operation):
+                api = self.draft_api(assets=[[{"id": 101, "name": self.archive.name}]])
+                respond = api.side_effect
+
+                def fail_delete(endpoint, *arguments, **kwargs):
+                    if kwargs.get("method") == "DELETE":
+                        raise ValueError("GitHub API request failed; response suppressed")
+                    return respond(endpoint, *arguments, **kwargs)
+
+                if operation == "delete":
+                    api.side_effect = fail_delete
+                upload = Mock(side_effect=ValueError("gh failed; credential-bearing output suppressed"))
+                with self.assertRaisesRegex(ValueError, "suppressed"):
+                    self.run_draft(api, upload)
+                self.assertEqual(upload.call_count, 0 if operation == "delete" else 1)
+
+    def test_gh_api_empty_delete_and_suppressed_errors(self):
+        with patch.object(release.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            self.assertIsNone(release.gh_api("repos/Beastry/example/releases/assets/101", method="DELETE"))
+            self.assertEqual(run.call_args.args[0],
+                             ["gh", "api", "repos/Beastry/example/releases/assets/101", "--method", "DELETE"])
+        for status in ("HTTP 403", "HTTP 404"):
+            with self.subTest(status=status), patch.object(release.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 1, "private response", status)):
+                with self.assertRaisesRegex(ValueError, "^GitHub API request failed; response suppressed$"):
+                    release.gh_api("repos/Beastry/example/releases?per_page=100&page=1")
+                if status == "HTTP 404":
+                    self.assertIsNone(release.gh_api("repos/Beastry/example/releases/42", missing_ok=True))
 
     def test_checksum_tampering_prevents_mutation(self):
         self.prepare_assets()
