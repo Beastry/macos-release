@@ -229,6 +229,17 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(command.call_args.args[0][:2], ["hdiutil", "detach"])
             self.assertFalse((self.directory / "mount").exists())
 
+    def test_detach_may_already_remove_mount_directory(self):
+        def fake_command(arguments, **kwargs):
+            if arguments[:2] == ["hdiutil", "detach"]:
+                (self.directory / "mount").rmdir()
+            return b""
+
+        with patch.object(release, "command", side_effect=fake_command):
+            with self.assertRaisesRegex(ValueError, "one top-level app"):
+                release.inspect_dmg(self.archive, self.directory, "Beastry/example", "")
+            self.assertFalse((self.directory / "mount").exists())
+
 
 class CleanupTests(unittest.TestCase):
     def test_cleanup_restores_search_list_and_deletes_all_material(self):
