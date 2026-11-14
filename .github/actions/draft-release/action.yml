@@ -1,0 +1,7 @@
+name: Draft GitHub Release only
+description: Refuse published releases and upload only DMG, checksum, and appcast
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: '"$RELEASE_PYTHON" "$GITHUB_ACTION_PATH/../../../scripts/release.py" draft'

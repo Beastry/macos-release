@@ -1,0 +1,7 @@
+name: Notarize and staple DMG
+description: Use ASC API credentials or validate an already stapled caller DMG
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/toolkit.sh" notarize

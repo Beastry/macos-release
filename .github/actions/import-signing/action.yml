@@ -1,0 +1,7 @@
+name: Import Developer ID signing credentials
+description: Import P12 and ASC API key into private per-run temporary state
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/toolkit.sh" setup

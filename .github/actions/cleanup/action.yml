@@ -1,0 +1,7 @@
+name: Clean signing state
+description: Restore search list and remove temporary keychain, certificates, and API key
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/toolkit.sh" cleanup

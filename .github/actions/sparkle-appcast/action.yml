@@ -1,0 +1,7 @@
+name: Sign and verify Sparkle appcast
+description: Pin official tooling, verify SUPublicEDKey, and write appcast plus checksum
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/toolkit.sh" sparkle
