@@ -1,8 +1,9 @@
 # macos-release
 
 Minimal reusable **macOS Developer ID → notarization → Sparkle → draft GitHub
-Release** automation for Beastry apps. From-scratch MIT implementation; see
-[LICENSE](LICENSE), Copyright 2026 Beastry. No app-specific builds, Windows/Linux,
+Release** automation for Beastry apps. From-scratch GPL-3.0-only implementation; see
+[LICENSE](LICENSE), Copyright 2026 Beastry, and [license history](LICENSES/README.md).
+No app-specific builds, Windows/Linux,
 Homebrew, App Store upload, or Pages deployment.
 
 ## Call the workflow
