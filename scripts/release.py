@@ -28,8 +28,10 @@ def command(arguments, **kwargs):
     return result.stdout
 
 
-def gh_api(endpoint, payload=None, missing_ok=False):
+def gh_api(endpoint, payload=None, missing_ok=False, method=None):
     arguments = ["gh", "api", endpoint]
+    if method is not None:
+        arguments += ["--method", method]
     if payload is not None:
         arguments += ["--method", "POST", "--input", "-"]
     result = subprocess.run(
@@ -40,7 +42,7 @@ def gh_api(endpoint, payload=None, missing_ok=False):
         if missing_ok and "HTTP 404" in result.stderr:
             return None
         raise ValueError("GitHub API request failed; response suppressed")
-    return json.loads(result.stdout)
+    return json.loads(result.stdout) if result.stdout.strip() else None
 
 
 def validate_repository(repository):
@@ -143,7 +145,40 @@ def require_draft(release):
 
 
 def existing_release(repository, tag):
-    return gh_api(f"repos/{repository}/releases/tags/{quote(tag, safe='')}", missing_ok=True)
+    matches = [release for release in release_pages(f"repos/{repository}/releases")
+               if release.get("tag_name") == tag]
+    if len(matches) > 1:
+        raise ValueError("Multiple releases have the requested tag; refusing ambiguous draft")
+    return matches[0] if matches else None
+
+
+def release_pages(endpoint):
+    """List every page, including unpublished drafts without a Git tag."""
+    page = 1
+    while True:
+        items = gh_api(f"{endpoint}?per_page=100&page={page}")
+        yield from items
+        if len(items) < 100:
+            break
+        page += 1
+
+
+def validate_draft(release, tag, target):
+    require_draft(release)
+    if release.get("tag_name") != tag:
+        raise ValueError("Draft has a different tag; refusing to mix artifacts")
+    if release.get("target_commitish") != target:
+        raise ValueError("Draft targets a different source commit; refusing to mix artifacts")
+    if type(release.get("id")) is not int or release["id"] <= 0:
+        raise ValueError("Draft has an invalid release ID")
+
+
+def current_draft(repository, release_id, tag, target):
+    current = gh_api(f"repos/{repository}/releases/{release_id}", missing_ok=True)
+    if current is None or current.get("id") != release_id:
+        raise ValueError("Draft release disappeared or changed during upload")
+    validate_draft(current, tag, target)
+    return current
 
 
 def published_feed(repository):
@@ -193,15 +228,21 @@ def draft_release(repository, tag, target, directory):
             "body": "Draft only. Review signatures, notarization, and assets before publishing.",
             "draft": True, "prerelease": False, "make_latest": "false",
         })
-        require_draft(release)
-    elif release.get("target_commitish") != target:
-        raise ValueError("Existing draft targets a different source commit; refusing to mix artifacts")
+    validate_draft(release, tag, target)
+    release_id = release["id"]
     for asset in (archive, checksum, directory / "appcast.xml"):
-        current = existing_release(repository, tag)
-        if current is None or current["id"] != release["id"]:
-            raise ValueError("Draft release disappeared or changed during upload")
-        require_draft(current)
-        command(["gh", "release", "upload", tag, str(asset), "--repo", repository, "--clobber"])
+        current_draft(repository, release_id, tag, target)
+        duplicates = [existing for existing in release_pages(f"repos/{repository}/releases/{release_id}/assets")
+                      if existing["name"] == asset.name]
+        for existing in duplicates:
+            current_draft(repository, release_id, tag, target)
+            gh_api(f"repos/{repository}/releases/assets/{existing['id']}", method="DELETE")
+        current_draft(repository, release_id, tag, target)
+        # Like --clobber, delete same-name assets before uploading; failure may leave them absent.
+        command(["gh", "api", f"https://uploads.github.com/repos/{repository}/releases/{release_id}/assets"
+                 f"?name={quote(asset.name, safe='')}", "--method", "POST",
+                 "-H", "Content-Type: application/octet-stream", "--input", str(asset)])
+        current_draft(repository, release_id, tag, target)
 
 
 def inspect_dmg(archive, state, repository, app_path):
