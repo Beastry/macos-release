@@ -234,7 +234,8 @@ def inspect_dmg(archive, state, repository, app_path):
         (Path(state) / "metadata.json").write_text(json.dumps(selected), encoding="utf-8")
     finally:
         command(["hdiutil", "detach", str(mount)])
-        mount.rmdir()
+        if mount.exists():
+            mount.rmdir()
 
 
 def main():
